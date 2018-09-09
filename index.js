@@ -1,19 +1,64 @@
-/**
- * This is the entry point for your Probot App.
- * @param {import('probot').Application} app - Probot's Application class.
- */
-module.exports = app => {
-  // Your code here
-  app.log('Yay, the app was loaded!')
+const getConfig = require('probot-config')
+const createScheduler = require('probot-scheduler')
+const Stale = require('./lib/stale')
 
-  app.on('issues.opened', async context => {
-    const issueComment = context.issue({ body: 'Thanks for opening this issue!' })
-    return context.github.issues.createComment(issueComment)
-  })
+module.exports = async app => {
+  // Visit all repositories to mark and sweep stale issues
+  const scheduler = createScheduler(app)
 
-  // For more information on building apps:
-  // https://probot.github.io/docs/
+  // Unmark stale issues if a user comments
+  const events = [
+    'issue_comment',
+    'issues',
+    'pull_request',
+    'pull_request_review',
+    'pull_request_review_comment'
+  ]
 
-  // To get your app running against GitHub, see:
-  // https://probot.github.io/docs/development/
+  app.on(events, unmark)
+  app.on('schedule.repository', markAndSweep)
+
+  async function unmark (context) {
+    if (!context.isBot) {
+      const stale = await forRepository(context)
+      let issue = context.payload.issue || context.payload.pull_request
+      const type = context.payload.issue ? 'issues' : 'pulls'
+
+      // Some payloads don't include labels
+      if (!issue.labels) {
+        try {
+          issue = (await context.github.issues.get(context.issue())).data
+        } catch (error) {
+          context.log('Issue not found')
+        }
+      }
+
+      const staleLabelAdded = context.payload.action === 'labeled' &&
+        context.payload.label.name === stale.config.staleLabel
+
+      if (stale.hasStaleLabel(type, issue) && issue.state !== 'closed' && !staleLabelAdded) {
+        stale.unmark(type, issue)
+      }
+    }
+  }
+
+  async function markAndSweep (context) {
+    const stale = await forRepository(context)
+    await stale.markAndSweep('pulls')
+    await stale.markAndSweep('issues')
+  }
+
+  async function forRepository (context) {
+    let config = await getConfig(context, 'stale.yml')
+
+    if (!config) {
+      scheduler.stop(context.payload.repository)
+      // Don't actually perform for repository without a config
+      config = {perform: false}
+    }
+
+    config = Object.assign(config, context.repo({logger: app.log}))
+
+    return new Stale(context.github, config)
+  }
 }
